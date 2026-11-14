@@ -18,6 +18,14 @@ import java.nio.charset.StandardCharsets;
 final class MraApi {
     private MraApi() { }
 
+    static final class HttpStatus extends IOException {
+        final int code;
+        HttpStatus(int code) {
+            super("MRA returned HTTP " + code + ".");
+            this.code = code;
+        }
+    }
+
     static JSONObject post(String path, JSONObject body, String token, String signature) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(BuildConfig.MRA_BASE_URL + path).openConnection();
         connection.setInstanceFollowRedirects(false);
@@ -40,7 +48,7 @@ final class MraApi {
         }
         try {
             int status = connection.getResponseCode();
-            if (status < 200 || status >= 300) throw new IOException("MRA returned HTTP " + status + ".");
+            if (status < 200 || status >= 300) throw new HttpStatus(status);
             try (InputStream in = connection.getInputStream(); ByteArrayOutputStream result = new ByteArrayOutputStream()) {
                 byte[] buffer = new byte[4096];
                 int size;

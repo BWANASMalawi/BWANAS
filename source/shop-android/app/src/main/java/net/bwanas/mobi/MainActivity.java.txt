@@ -1,4 +1,4 @@
---- shop-android/app/src/main/java/net/bwanas/mobi/MainActivity.java · lines 226–273 ---
+--- shop-android/app/src/main/java/net/bwanas/mobi/MainActivity.java · lines 226–275 ---
     private boolean fiscalSubmissionRequired() {
         return SecureStore.hasMraConfiguration(this) || SecureStore.hasPendingMraActivation(this)
                 || !localStore.state("mra_assignment_id").isEmpty() || localStore.hasUnsubmittedFiscalSales()
@@ -7,7 +7,7 @@
 
     private boolean requireSalesReady() {
         if (!fiscalSubmissionRequired()) return requireSalesSync();
-        if (SecureStore.hasMraConfiguration(this) && !localStore.hasUnsubmittedFiscalSales()
+        if (SecureStore.hasMraConfiguration(this) && !localStore.hasUnresolvedOnlineFiscalSale()
                 && localStore.state("mra_bound_device").equals(localStore.state("device_id"))) {
             return requireSalesSync();
         }
@@ -47,6 +47,8 @@
             localStore.saveState("mra_activation_notice", "MRA activation is pending. Check the TAC, product ID and terminal status.");
         }
     }
+
+    /** Check release information once daily, separate from catalogue heartbeats. */
 
 --- shop-android/app/src/main/java/net/bwanas/mobi/MainActivity.java · lines 1238–1357 ---
     private void completeWorkflow(String title, TextView message) {
@@ -218,3 +220,38 @@
                         }
                         break;
                     case "stock_take":
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/MainActivity.java · lines 1490–1509 ---
+    private int reconnectBootCount(){return Settings.Global.getInt(getContentResolver(),"boot_count",-1);}
+    private long reconnectRemaining(){
+        try{JSONObject anchor=new JSONObject(localStore.state("sales_reconnect_anchor"));
+            return ReconnectPolicy.remaining(anchor.getLong("wall"),anchor.getLong("elapsed"),anchor.getInt("boot"),System.currentTimeMillis(),android.os.SystemClock.elapsedRealtime(),reconnectBootCount());
+        }catch(Exception ignored){return 0;}
+    }
+    private String reconnectMessage(){
+        long remaining=reconnectRemaining();
+        if(remaining==0)return "Sales paused. Connect to the internet and sync saved transactions to renew the 24-hour sales window.";
+        if(remaining<=ReconnectPolicy.WARNING_MS)return "Reconnect and sync within "+Math.max(1,(remaining+59999)/60000)+" minutes. New sales stop after 24 hours without a completed sync.";
+        return "";
+    }
+    private boolean requireSalesSync(){
+        if(reconnectRemaining()>0&&localStore.receiptLeaseReady())return true;
+        new AlertDialog.Builder(this).setTitle("Reconnect required").setMessage(localStore.receiptLeaseReady()?reconnectMessage():"Connect and sync once to prepare receipt numbering.")
+            .setPositiveButton("Sync now",(dialog,which)->syncAndPruneAsync())
+            .setNeutralButton("Review saved transactions",(dialog,which)->showQueueRecovery())
+            .setNegativeButton("Close",null).show();
+        syncAndPruneAsync();return false;
+    }
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/MainActivity.java · lines 1532–1543 ---
+    private void renewReconnectWindow(String deviceKey)throws Exception{
+        if(localStore.queueSummary().getInt("pending_count")>0)return;
+        JSONObject heartbeat=BwanasApiClient.heartbeat(deviceKey);
+        if(heartbeat.optBoolean("sign_out",false))return;
+        if (!refreshCatalogueIfNeeded(deviceKey,heartbeat.optInt("sync_version",0))) return;
+        BwanasApiClient.ensureReceiptLease(deviceKey);
+        try { mraSales.refreshAfterSync(); }
+        catch (Exception ignored) { /* A sale will recheck the terminal before checkout. */ }
+        JSONObject anchor=new JSONObject().put("wall",System.currentTimeMillis()).put("elapsed",android.os.SystemClock.elapsedRealtime()).put("boot",reconnectBootCount());
+        if (localStore.renewReconnectAnchor(anchor.toString())) runOnUiThread(this::updateReconnectStatus);
+    }

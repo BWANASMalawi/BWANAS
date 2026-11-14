@@ -111,7 +111,7 @@
         activity.findViewById(R.id.receiptBack).setOnClickListener(v -> { if (fromSale) home.run(); else reports.run(); });
         LocalStore.FiscalSale fiscal = localStore.fiscalSale(operationId);
         if (fiscal != null) {
-            showFiscalReceipt(operationId, status);
+            showFiscalReceipt(operationId, status, fromSale);
             return;
         }
         if (receipt.isEmpty()) {
@@ -125,10 +125,10 @@
 
     void refreshFiscalReceipt(String operationId) {
         TextView status = activity.findViewById(R.id.receiptStatus);
-        if (status != null && operationId.equals(status.getTag())) showFiscalReceipt(operationId, status);
+        if (status != null && operationId.equals(status.getTag())) showFiscalReceipt(operationId, status, false);
     }
 
-    private void showFiscalReceipt(String operationId, TextView status) {
+    private void showFiscalReceipt(String operationId, TextView status, boolean fromSale) {
         status.setTag(operationId);
         Button print = activity.findViewById(R.id.receiptPrint);
         TextView text = activity.findViewById(R.id.receiptText);
@@ -148,7 +148,8 @@
             text.setText(receipt);
             image.setImageBitmap(qr);
             image.setVisibility(View.VISIBLE);
-            status.setText("Confirmed by MRA. Scan the QR code to verify.");
+            boolean pending = !"submitted".equals(fiscal.state);
+            status.setText(pending ? "Offline MRA receipt. Sale saved for sync." : "Confirmed by MRA. Scan the QR code to verify.");
             print.setEnabled(true);
             print.setOnClickListener(view -> {
                 print.setEnabled(false);
@@ -159,8 +160,9 @@
                     print.setEnabled(true);
                 });
             });
+            if (fromSale && pending) print.performClick();
         } catch (Exception error) {
-            status.setText("MRA confirmed this sale. The fiscal receipt could not be displayed.");
+            status.setText("Sale saved. The fiscal receipt could not be displayed.");
         }
     }
 
@@ -244,5 +246,3 @@
             localStore.setReceiptPrinterStatus(operationId, printed ? "printed" : "print_failed");
             status.setText(message);
         });
-    }
-}

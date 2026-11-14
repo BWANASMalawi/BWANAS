@@ -1,8 +1,9 @@
-# BWANAS Sales Mobi 1.4.15 MRA review
+# BWANAS Sales Mobi 1.5.2 MRA review
 
-The signed APK is the complete Sales Mobi application currently published by BWANAS. Package net.bwanas.mobi, version code 54.
-APK SHA-256 99b95376143cd9ba24675818ddc21fd20983c00a004a153cf8741fd8902da2ce
+Sales Mobi package `net.bwanas.mobi`, Android version code 57. The signed APK is distributed through the Sales website.
 
-The source contains the Android cash sale, terminal activation, MRA submission and invoice recovery, receipt formatting, and built-in printer code. Snippets of shared classes are copied verbatim with their original line ranges. This is an inspection package. It depends on the rest of the private application to build. The APK is a compiled Android application and can be inspected.
+APK SHA-256 `27b10010c0dc082e6c9cd135a72109d345365b4b4e428ae2d34523a503a9b95d`
 
-The printer uses the fixed Small BWANAS logo and the same validated Sagereal bitmap command for fiscal QR codes. Physical reprint and sample QR tests passed. A live MRA-accepted fiscal sale still needs to be demonstrated. Enabling activation and storing fiscal receipt data requires the separately prepared BWANAS server update.
+This inspection package contains the Android cash sale, terminal activation, MRA submission and invoice recovery, receipt formatting, and built-in printer source. Shared classes are shown in excerpts with their line ranges. Building requires the rest of the private application.
+
+On a provisioned terminal and within its offline limits, the app signs the sale, saves it and prints the QR during an outage. The original checkout deadline and saved sales survive reboot. Upload resumes when connectivity returns. Android emulator verification used a local MRA test service. Official fiscal acceptance and QR validation require MRA provisioning.

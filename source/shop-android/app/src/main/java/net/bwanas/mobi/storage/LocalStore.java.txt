@@ -1,8 +1,13 @@
 --- shop-android/app/src/main/java/net/bwanas/mobi/storage/LocalStore.java · lines 45–46 ---
-        db.execSQL("CREATE TABLE receipt (operation_id TEXT PRIMARY KEY, receipt_text TEXT NOT NULL, printer_status TEXT NOT NULL DEFAULT 'not_printed', created_at TEXT NOT NULL)");
-        db.execSQL("CREATE TABLE mra_sale (operation_id TEXT PRIMARY KEY, fiscal_payload TEXT NOT NULL, fiscal_response TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+        db.execSQL("CREATE TABLE price_rules (rule_id TEXT PRIMARY KEY, sku TEXT NOT NULL, customer_number TEXT, minimum_quantity NUMERIC NOT NULL, maximum_quantity NUMERIC, fixed_price NUMERIC, discount_percent NUMERIC, discount_amount NUMERIC, starts_on TEXT, ends_on TEXT, sync_version INTEGER NOT NULL DEFAULT 0)");
+        db.execSQL("CREATE TABLE operation_header (operation_id TEXT PRIMARY KEY, operation_type TEXT NOT NULL, status TEXT NOT NULL, site_code TEXT NOT NULL, user_name TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT, payload TEXT NOT NULL)");
 
 --- shop-android/app/src/main/java/net/bwanas/mobi/storage/LocalStore.java · lines 58–139 ---
+        if (oldVersion < 2) db.execSQL("CREATE TABLE IF NOT EXISTS receipt (operation_id TEXT PRIMARY KEY, receipt_text TEXT NOT NULL, printer_status TEXT NOT NULL DEFAULT 'not_printed', created_at TEXT NOT NULL)");
+        if (oldVersion < 3) db.execSQL("CREATE TABLE IF NOT EXISTS mra_sale (operation_id TEXT PRIMARY KEY, fiscal_payload TEXT NOT NULL, fiscal_response TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+    }
+
+    public String createOperation(String type, String siteCode, String userName, String payload, String timestamp) {
         String operationId = UUID.randomUUID().toString();
         SQLiteDatabase db = getWritableDatabase();
         db.beginTransaction();
@@ -80,13 +85,13 @@
             }
         } catch (JSONException error) {
             throw new IllegalArgumentException("Sale lines could not be checked", error);
-        }
-    }
-
-    /** Ranges are bound to the enrolled device and shop, never to the signed-in cashier. */
-    private JSONObject receiptLease() {
 
 --- shop-android/app/src/main/java/net/bwanas/mobi/storage/LocalStore.java · lines 172–193 ---
+            if(incoming.getString("lease_id").equals(old.optString("lease_id")))next=Math.max(next,old.optLong("next_sequence",next));
+            else if(receiptLeaseReady())throw new IllegalStateException("Current receipt range still has unused numbers");
+            incoming.put("next_sequence",next);saveState("receipt_lease",incoming.toString());db.setTransactionSuccessful();
+        } finally {db.endTransaction();}
+    }
     private String allocateReceipt(String operationId,String payload) {
         if(!receiptLeaseReady())throw new IllegalStateException("Connect and sync to prepare receipt numbering before selling");
         try {
@@ -104,13 +109,24 @@
         }
     }
     public String receiptLeaseId(String operationId) {
-        try(Cursor row=getReadableDatabase().rawQuery("SELECT lease_id FROM receipt_number WHERE operation_id=?",new String[]{operationId})) {
-            return row.moveToFirst()?row.getString(0):"";
-        }
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/storage/LocalStore.java · lines 268–279 ---
+    public boolean renewReconnectAnchor(String anchor) {
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            if (hasPendingEvents(db, null) || inventoryRefreshPending()) return false;
+            saveState("sales_reconnect_anchor", anchor);
+            db.setTransactionSuccessful();
+            return true;
+        } finally { db.endTransaction(); }
     }
 
+    /** Replaces the local sellable catalogue atomically after a successful device bootstrap. */
 
---- shop-android/app/src/main/java/net/bwanas/mobi/storage/LocalStore.java · lines 500–583 ---
+--- shop-android/app/src/main/java/net/bwanas/mobi/storage/LocalStore.java · lines 503–630 ---
+    public void saveReceipt(String operationId, String text, String timestamp) {
+        ContentValues values = new ContentValues(); values.put("operation_id", operationId); values.put("receipt_text", text); values.put("created_at", timestamp);
         if (getWritableDatabase().insertWithOnConflict("receipt", null, values, SQLiteDatabase.CONFLICT_REPLACE) < 0) {
             throw new IllegalStateException("Could not save receipt");
         }
@@ -141,25 +157,63 @@
         }
     }
 
+    public boolean hasUnresolvedOnlineFiscalSale() {
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT 1 FROM mra_sale WHERE state IN ('ready','sending') LIMIT 1", null)) {
+            return c.moveToFirst();
+        }
+    }
+
+    private void checkOfflineLimits(SQLiteDatabase db, JSONObject invoice, JSONObject limits) throws JSONException {
+        java.math.BigDecimal amount = new java.math.BigDecimal(invoice.getJSONObject("invoiceSummary").get("invoiceTotal").toString());
+        java.math.BigDecimal maxAmount = new java.math.BigDecimal(limits.get("maxCummulativeAmount").toString());
+        double maxHours = limits.getDouble("maxTransactionAgeInHours");
+        long profileTime = ((Number) invoice.remove("offlineProfileTime")).longValue();
+        long now = ((Number) invoice.remove("offlineSaleTime")).longValue();
+        if (maxHours <= 0 || maxAmount.signum() <= 0 || now < profileTime || now - profileTime >= maxHours * 3600000d) {
+            throw new IllegalStateException("MRA offline time limit reached or offline sales are unavailable. Reconnect and sync.");
+        }
+        try (Cursor c = db.rawQuery(
+                "SELECT fiscal_payload FROM mra_sale WHERE state IN ('offline_ready','offline_sending')", null)) {
+            while (c.moveToNext()) {
+                JSONObject queued = new JSONObject(c.getString(0));
+                amount = amount.add(new java.math.BigDecimal(queued.getJSONObject("invoiceSummary").get("invoiceTotal").toString()));
+            }
+        }
+        if (amount.compareTo(maxAmount) > 0) {
+            throw new IllegalStateException("MRA offline sales amount limit reached. Reconnect and sync.");
+        }
+    }
+
     private void saveFiscalSale(SQLiteDatabase db, String operationId, JSONObject invoice, String timestamp) {
-        if (hasUnsubmittedFiscalSales()) throw new IllegalStateException("A fiscal sale is already awaiting confirmation.");
+        JSONObject limits = (JSONObject) invoice.remove("offlineLimits");
+        if (hasUnresolvedOnlineFiscalSale() || (limits == null && hasUnsubmittedFiscalSales())) {
+            throw new IllegalStateException("A fiscal sale is already awaiting confirmation.");
+        }
         try {
+            if (limits != null) checkOfflineLimits(db, invoice, limits);
             String prefix = (String) invoice.remove("numberPrefix");
             String counterKey = "mra_sequence_" + prefix;
             String previous = state(counterKey);
             long next = previous.isEmpty() ? 1 : Math.addExact(Long.parseLong(previous), 1);
             String invoiceNumber = prefix + "-" + net.bwanas.mobi.mra.MraInvoice.radix64(next);
             invoice.getJSONObject("invoiceHeader").put("invoiceNumber", invoiceNumber);
+            if (limits != null) {
+                net.bwanas.mobi.mra.MraOfflineSignature.sign(invoice, prefix.substring(prefix.lastIndexOf('-') + 1),
+                        net.bwanas.mobi.mra.MraActivationClient.offlineSigningKey(context));
+            }
             saveState(counterKey, Long.toString(next));
 
             ContentValues row = new ContentValues();
             row.put("operation_id", operationId);
             row.put("fiscal_payload", invoice.toString());
-            row.put("state", "ready");
+            row.put("state", limits == null ? "ready" : "offline_ready");
             row.put("created_at", timestamp);
             row.put("updated_at", timestamp);
             db.insertOrThrow("mra_sale", null, row);
-        } catch (JSONException error) {
+        } catch (IllegalStateException error) {
+            throw error;
+        } catch (Exception error) {
             throw new IllegalStateException("The MRA invoice could not be saved.", error);
         }
     }
@@ -195,3 +249,7 @@
         }
     }
 
+    /**
+     * Removes local history as soon as both the BWANAS cloud and, where applicable, MRA have confirmed it.
+     * Pending or failed outbox work, and MRA work that has not been submitted, are never removed.
+     */

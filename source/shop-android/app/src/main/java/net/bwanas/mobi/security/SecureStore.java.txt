@@ -1,4 +1,4 @@
---- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 20–48 ---
+--- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 20–56 ---
 /** Stores MRA configuration encrypted with an Android Keystore key unique to this POS. */
 public final class SecureStore {
     private static final String KEYSTORE = "AndroidKeyStore";
@@ -6,6 +6,14 @@ public final class SecureStore {
     private static final String PREFS = "bwanas_mobi_secure";
 
     private SecureStore() { }
+
+    public static void saveMraOfflineProfile(Context context, String json) throws Exception {
+        save(context, "mra_offline_profile", json, true);
+    }
+
+    public static String mraOfflineProfile(Context context) throws Exception {
+        return read(context, "mra_offline_profile");
+    }
 
     public static void saveMraConfiguration(Context context, String json) throws Exception {
         save(context, "mra_config", json, true);
@@ -29,12 +37,12 @@ public final class SecureStore {
 
     public static String mraConfiguration(Context context) throws Exception { return read(context, "mra_config"); }
 
---- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 51–53 ---
+--- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 59–61 ---
     public static boolean hasPendingMraActivation(Context context) {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).contains("mra_activation_pending");
     }
 
---- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 103–108 ---
+--- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 111–116 ---
     /** Does not touch local completed transactions; those remain available to an administrator after re-enrolment. */
     public static void clearDeviceSession(Context context) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
@@ -42,7 +50,7 @@ public final class SecureStore {
                 .remove("offline_username").remove("offline_salt").remove("offline_verifier").apply();
     }
 
---- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 123–155 ---
+--- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 131–163 ---
     private static void save(Context context, String name, String value) throws Exception {
         save(context, name, value, false);
     }

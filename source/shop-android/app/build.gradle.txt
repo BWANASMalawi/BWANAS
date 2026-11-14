@@ -3,8 +3,8 @@
         minSdk 23
         targetSdk 35
         testInstrumentationRunner project.findProperty('acceptanceRunner') ?: 'net.bwanas.mobi.FlowCheck'
-        versionCode 54
-        versionName '1.4.15'
+        versionCode 57
+        versionName '1.5.2'
         buildConfigField 'String', 'MRA_BASE_URL', "\"https://eis-api.mra.mw/api/v1/\""
     }
 

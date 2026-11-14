@@ -32,18 +32,53 @@ public final class MraSales {
 
     public JSONObject prepare(JSONArray lines, String timestamp, long soldAt) throws Exception {
         checkBinding();
-        if (store.hasUnsubmittedFiscalSales()) throw new IllegalStateException("Sync the previous MRA sale first.");
+        if (store.hasUnresolvedOnlineFiscalSale()) throw new IllegalStateException("Sync the previous MRA sale first.");
         if ("true".equals(store.state("mra_blocked"))) {
             String message = blockMessage();
             if (!message.isEmpty()) throw new IllegalStateException(message);
         }
-        MraActivationClient.checkConnection(context);
-        long now = SystemClock.elapsedRealtime();
-        if (configuration == null || now - configuredAt >= CONFIGURATION_CACHE_MS
-                || "true".equals(store.state("mra_refresh_required"))) {
-            loadConfiguration();
+        try {
+            MraActivationClient.checkConnection(context);
+            long now = SystemClock.elapsedRealtime();
+            if (configuration == null || now - configuredAt >= CONFIGURATION_CACHE_MS
+                    || "true".equals(store.state("mra_refresh_required"))) {
+                loadConfiguration();
+            }
+        } catch (java.net.UnknownHostException | java.net.ConnectException |
+                 java.net.NoRouteToHostException | java.net.SocketTimeoutException error) {
+            return prepareOffline(lines, timestamp, soldAt);
+        } catch (MraApi.HttpStatus error) {
+            if (error.code != 502 && error.code != 503 && error.code != 504) throw error;
+            return prepareOffline(lines, timestamp, soldAt);
+        }
+        if (store.hasUnsubmittedFiscalSales()) {
+            throw new IllegalStateException("Sync the saved MRA sales before starting a new sale.");
         }
         return configuration.prepare(lines, timestamp, soldAt);
+    }
+
+    private JSONObject prepareOffline(JSONArray lines, String timestamp, long soldAt) throws Exception {
+        String saved = SecureStore.mraOfflineProfile(context);
+        if (saved.isEmpty() || "true".equals(store.state("mra_refresh_required"))) {
+            throw new IllegalStateException("Connect to MRA first to download offline checkout settings.");
+        }
+        JSONObject profile = new JSONObject(saved);
+        JSONObject activation = MraActivationClient.activation(context).getJSONObject("activatedTerminal");
+        if (!activation.getString("terminalId").equals(profile.getString("terminalId"))) {
+            throw new IllegalStateException("Connect to MRA to refresh this terminal's settings.");
+        }
+        JSONObject config = profile.getJSONObject("configuration");
+        JSONObject limits = config.getJSONObject("terminalConfiguration").optJSONObject("offlineLimit");
+        if (limits == null) throw new IllegalStateException("MRA has not enabled offline sales for this terminal.");
+        return new MraInvoice(config, profile.getJSONArray("products"), activation).prepare(lines, timestamp, soldAt)
+                .put("offlineLimits", limits).put("offlineProfileTime", profile.getLong("downloadedAt"))
+                .put("offlineSaleTime", soldAt);
+    }
+
+    public void refreshAfterSync() throws Exception {
+        if (!SecureStore.hasMraConfiguration(context)) return;
+        checkBinding();
+        if (configuration == null || "true".equals(store.state("mra_refresh_required"))) loadConfiguration();
     }
 
     private void loadConfiguration() throws Exception {
@@ -59,7 +94,11 @@ public final class MraSales {
         JSONObject catalogue = MraApi.post("utilities/get-terminal-site-products", scope, token, null);
         if (!MraApi.successful(catalogue)) throw new IOException("MRA site products are unavailable.");
         JSONObject activation = MraActivationClient.activation(context).getJSONObject("activatedTerminal");
-        configuration = new MraInvoice(config, catalogue.getJSONArray("data"), activation);
+        JSONArray products = catalogue.getJSONArray("data");
+        SecureStore.saveMraOfflineProfile(context, new JSONObject()
+                .put("terminalId", activation.getString("terminalId")).put("downloadedAt", System.currentTimeMillis())
+                .put("configuration", config).put("products", products).toString());
+        configuration = new MraInvoice(config, products, activation);
         configuredAt = SystemClock.elapsedRealtime();
         store.saveState("mra_refresh_required", "");
     }
@@ -69,11 +108,25 @@ public final class MraSales {
         if (!SecureStore.hasMraConfiguration(context)) throw new IOException("MRA credentials are unavailable.");
         checkBinding();
         JSONObject invoice = new JSONObject(sale.payload);
+        invoice.remove("offlineValidationUrl");
         String number = invoice.getJSONObject("invoiceHeader").getString("invoiceNumber");
         String token = MraActivationClient.token(context);
-        if ("ready".equals(sale.state)) {
-            // Any interruption after this transition is treated as an uncertain submission.
-            store.updateFiscalSale(operationId, "ready", "sending", "");
+        boolean offline = invoice.getJSONObject("invoiceSummary").has("offlineSignature");
+        String sendingState = offline ? "offline_sending" : "sending";
+        String retryState = offline ? "offline_ready" : "ready";
+        boolean maySubmit = retryState.equals(sale.state);
+        if (offline && sendingState.equals(sale.state)) {
+            try {
+                recover(operationId, invoice, number, token, sendingState);
+                return;
+            } catch (MraApi.HttpStatus error) {
+                if (error.code != 404) throw error;
+                maySubmit = true;
+            }
+        }
+        if (maySubmit) {
+            // Save the attempted state before network I/O. Recovery always looks up the original invoice number.
+            store.updateFiscalSale(operationId, sale.state, sendingState, "");
             JSONObject response = MraApi.post("sales/submit-sales-transaction", invoice, token, null);
             JSONObject data = response.optJSONObject("data");
             if (data != null && data.optBoolean("shouldDownloadLatestConfig")) {
@@ -82,26 +135,28 @@ public final class MraSales {
             if (data != null && data.optBoolean("shouldBlockTerminal")) store.saveState("mra_blocked", "true");
             if (!MraApi.successful(response) || MraApi.validationUrl(data).isEmpty()
                     || !MraApi.noErrors(data, "validationErrors")) {
-                store.updateFiscalSale(operationId, "sending", "sending", response.toString());
+                store.updateFiscalSale(operationId, sendingState, sendingState, response.toString());
                 throw new IOException("MRA did not confirm invoice " + number + ". Sync to check its status.");
             }
-            store.updateFiscalSale(operationId, "sending", "submitted", data.toString());
-        } else if ("sending".equals(sale.state)) {
-            JSONObject response = MraApi.post("sales/get-invoice-by-number",
-                    new JSONObject().put("invoiceNumber", number), token, null);
-            JSONObject data = response.optJSONObject("data");
-            JSONObject header = data == null ? null : data.optJSONObject("invoiceHeader");
-            if (!MraApi.successful(response) || MraApi.validationUrl(data).isEmpty() || header == null
-                    || !matchesInvoice(invoice, data)) {
-                throw new IOException("MRA has not confirmed invoice " + number + ". Ask an administrator to review it.");
-            }
-            // The submit response may have been lost, including any configuration refresh flag.
-            store.saveState("mra_refresh_required", "true");
-            store.saveState("mra_blocked", "true");
-            store.updateFiscalSale(operationId, "sending", "submitted", data.toString());
+            store.updateFiscalSale(operationId, sendingState, "submitted", data.toString());
+        } else if (sendingState.equals(sale.state)) {
+            recover(operationId, invoice, number, token, sendingState);
         } else {
             throw new IOException("This saved fiscal sale requires administrator review.");
         }
+    }
+
+    private void recover(String operationId, JSONObject invoice, String number, String token, String sendingState) throws Exception {
+        JSONObject response = MraApi.post("sales/get-invoice-by-number",
+                new JSONObject().put("invoiceNumber", number), token, null);
+        JSONObject data = response.optJSONObject("data");
+        if (!MraApi.successful(response) || MraApi.validationUrl(data).isEmpty() || !matchesInvoice(invoice, data)) {
+            throw new IOException("MRA has not confirmed invoice " + number + ". Ask an administrator to review it.");
+        }
+        // The original response may have included configuration or terminal block flags.
+        store.saveState("mra_refresh_required", "true");
+        store.saveState("mra_blocked", "true");
+        store.updateFiscalSale(operationId, sendingState, "submitted", data.toString());
     }
 
     static boolean matchesInvoice(JSONObject saved, JSONObject found) throws Exception {
@@ -166,8 +221,11 @@ public final class MraSales {
     }
 
     public static String validationUrl(LocalStore.FiscalSale sale) {
-        if (sale == null || !"submitted".equals(sale.state)) return "";
-        try { return MraApi.validationUrl(new JSONObject(sale.response)); }
-        catch (org.json.JSONException error) { return ""; }
+        if (sale == null) return "";
+        try {
+            String offline = new JSONObject(sale.payload).optString("offlineValidationUrl");
+            if (!offline.isEmpty()) return offline;
+            return "submitted".equals(sale.state) ? MraApi.validationUrl(new JSONObject(sale.response)) : "";
+        } catch (org.json.JSONException error) { return ""; }
     }
 }

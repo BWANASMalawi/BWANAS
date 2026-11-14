@@ -127,6 +127,11 @@ public final class MraActivationClient {
         return "MRA terminal connection is available.";
     }
 
+    public static String offlineSigningKey(Context context) throws Exception {
+        return activation(context).getJSONObject("activatedTerminal").getJSONObject("terminalCredentials")
+                .getString("secretKey");
+    }
+
     static JSONObject activation(Context context) throws Exception {
         return new JSONObject(SecureStore.mraConfiguration(context)).getJSONObject("data");
     }
