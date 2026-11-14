@@ -1,0 +1,20 @@
+--- shop-android/app/build.gradle · lines 14–21 ---
+        applicationId 'net.bwanas.mobi'
+        minSdk 23
+        targetSdk 35
+        testInstrumentationRunner project.findProperty('acceptanceRunner') ?: 'net.bwanas.mobi.FlowCheck'
+        versionCode 54
+        versionName '1.4.15'
+        buildConfigField 'String', 'MRA_BASE_URL', "\"https://eis-api.mra.mw/api/v1/\""
+    }
+
+--- shop-android/app/build.gradle · lines 47–55 ---
+        release {
+            signingConfig signingConfigs.bwanasRelease
+            debuggable false
+            buildConfigField 'String', 'API_BASE_URL', '"https://sales.bwanas.net/v1/"' 
+        }
+    }
+}
+
+dependencies { implementation files('libs/zxing-core-3.5.4.jar') }

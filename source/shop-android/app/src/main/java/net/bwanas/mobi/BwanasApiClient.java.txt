@@ -1,0 +1,78 @@
+--- shop-android/app/src/main/java/net/bwanas/mobi/BwanasApiClient.java · lines 209–234 ---
+    }
+    public static void reportQueue(String deviceKey){
+        try {
+            JSONObject summary = store().queueSummary().put("app_version", BuildConfig.VERSION_NAME);
+            String assignment = store().state("mra_assignment_id");
+            if (!assignment.isEmpty() && store().state("mra_activation_status").startsWith("activated:")
+                    && store().state("device_id").equals(store().state("mra_bound_device"))) {
+                summary.put("mra_assignment_id", assignment);
+            }
+            cashierCall("POST", "controls/pulse", summary, deviceKey);
+        } catch (Exception ignored) {
+            // A telemetry failure must not block the outbox.
+        }
+    }
+    public static JSONObject heartbeat(String deviceKey) throws Exception {
+        reportQueue(deviceKey);
+        JSONObject result=new JSONObject(cashierCall("GET", "mobile/status", null, deviceKey));store().saveState("site_id",result.getString("site_id"));rememberMraAssignment(result);functions(deviceKey);return result;
+    }
+    private static void rememberMraAssignment(JSONObject status) {
+        if (status.optBoolean("mra_terminal_activated")) store().saveState("mra_server_activated", "true");
+        String assignment = status.optString("mra_assignment_id", "");
+        if (!assignment.isEmpty() && !status.isNull("mra_assignment_id")) {
+            store().saveState("mra_assignment_id", assignment);
+        }
+    }
+
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/BwanasApiClient.java · lines 251–294 ---
+    private static final class QueuedCashier {
+        private final String username;
+        private final String password;
+
+        QueuedCashier(String recordedCashier, JSONObject payload) throws Exception {
+            username = SecureStore.apiUsername(context);
+            password = SecureStore.apiPassword(context);
+            if (recordedCashier == null || recordedCashier.isEmpty()) {
+                recordedCashier = payload.optString("user_name");
+            }
+            if (recordedCashier.isEmpty() || !recordedCashier.equalsIgnoreCase(username)) {
+                throw new CashierMismatch(recordedCashier.isEmpty()
+                        ? "A saved transaction has no cashier recorded. Contact an administrator."
+                        : "Cashier " + recordedCashier + " must sign in to sync their saved transactions.");
+            }
+            if (password.isEmpty()) throw new IllegalStateException("Cashier sign-in required");
+        }
+
+        String post(String path, JSONObject payload, String deviceKey) throws Exception {
+            return call("POST", path, payload, username, password, deviceKey, true);
+        }
+    }
+
+    public static JSONObject submitSale(JSONObject old, String recordedCashier, String deviceKey) throws Exception {
+        QueuedCashier cashier = new QueuedCashier(recordedCashier, old);
+        JSONArray original = old.getJSONArray("lines"), lines = new JSONArray();
+        BigDecimal total = BigDecimal.ZERO;
+        for (int i = 0; i < original.length(); i++) {
+            JSONObject line = original.getJSONObject(i); String code = line.getString("sku");
+            double quantity = line.getDouble("quantity"), price = line.getDouble("unit_price");
+            JSONObject converted = new JSONObject().put("item_code", code).put("quantity", quantity).put("unit_price", price);
+            String version = line.optString("price_version_id", store().state("price_version_" + code));
+            if (!version.isEmpty() && !"null".equals(version)) converted.put("price_version_id", version);
+            lines.put(converted);
+            total = total.add(TransactionAmounts.lineTotal(quantity, price));
+        }
+        JSONObject payload = new JSONObject().put("device_transaction_id", old.getString("transaction_id"))
+                .put("outlet_code", old.getString("site_code")).put("sold_at", old.getString("sold_at"))
+                .put("lines", lines).put("payments", new JSONArray().put(new JSONObject()
+                        .put("method", "cash").put("amount", total).put("reference", "")));
+        if(old.has("receipt_number"))payload.put("receipt_number",old.getString("receipt_number")).put("receipt_lease_id",old.getString("receipt_lease_id"));
+        if (old.has("fiscal_receipt")) payload.put("fiscal_receipt", old.getJSONObject("fiscal_receipt"));
+        return new JSONObject(cashier.post("sales", payload, deviceKey));
+    }
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/BwanasApiClient.java · lines 359–361 ---
+    public static JSONObject deviceMraActivationCode(String deviceKey) throws Exception {
+        return new JSONObject(cashierCall("GET", "devices/current/mra-activation", null, deviceKey));
+    }

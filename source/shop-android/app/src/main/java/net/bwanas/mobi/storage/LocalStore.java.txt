@@ -1,0 +1,197 @@
+--- shop-android/app/src/main/java/net/bwanas/mobi/storage/LocalStore.java · lines 45–46 ---
+        db.execSQL("CREATE TABLE receipt (operation_id TEXT PRIMARY KEY, receipt_text TEXT NOT NULL, printer_status TEXT NOT NULL DEFAULT 'not_printed', created_at TEXT NOT NULL)");
+        db.execSQL("CREATE TABLE mra_sale (operation_id TEXT PRIMARY KEY, fiscal_payload TEXT NOT NULL, fiscal_response TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/storage/LocalStore.java · lines 58–139 ---
+        String operationId = UUID.randomUUID().toString();
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            ContentValues operation = new ContentValues();
+            operation.put("operation_id", operationId); operation.put("operation_type", type); operation.put("status", "draft");
+            operation.put("site_code", siteCode); operation.put("user_name", userName); operation.put("created_at", timestamp); operation.put("payload", payload);
+            db.insertOrThrow("operation_header", null, operation);
+            db.setTransactionSuccessful();
+            return operationId;
+        } finally { db.endTransaction(); }
+    }
+
+    public void completeAndQueue(String operationId, String eventType, String payload, String timestamp) {
+        completeAndQueueWithStockReservation(operationId, eventType, payload, timestamp, false);
+    }
+
+    /** Completion, outbound queueing and local stock reservation commit together or not at all. */
+    public void completeAndQueueWithStockReservation(String operationId, String eventType, String payload, String timestamp, boolean reserveStock) {
+        completeAndQueueWithStockReservation(operationId, eventType, payload, timestamp, reserveStock, null);
+    }
+
+    public void completeAndQueueWithStockReservation(String operationId, String eventType, String payload,
+                                                      String timestamp, boolean reserveStock, JSONObject fiscalInvoice) {
+        if(net.bwanas.mobi.RequiredUpdatePolicy.blocked(state("required_app_version")))throw new IllegalStateException("Required app update must be installed first");
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            try (Cursor header=db.rawQuery("SELECT operation_type FROM operation_header WHERE operation_id=? AND status='draft'",new String[]{operationId})) {
+                if(!header.moveToFirst())throw new IllegalStateException("Operation is not an open draft");
+                if("sale".equals(header.getString(0)))payload=allocateReceipt(operationId,payload);
+            }
+            ContentValues completed = new ContentValues(); completed.put("payload",payload); completed.put("status", "completed"); completed.put("completed_at", timestamp);
+            if (db.update("operation_header", completed, "operation_id=? AND status='draft'", new String[]{operationId}) != 1) throw new IllegalStateException("Operation is not an open draft");
+            if (reserveStock) {
+                validateSalePrices(db, payload);
+                try (Cursor lines = db.rawQuery("SELECT sku,quantity FROM operation_line WHERE operation_id=? ORDER BY line_no", new String[]{operationId})) {
+                    while (lines.moveToNext()) {
+                        String sku = lines.getString(0); double quantity = lines.getDouble(1);
+                        try (Cursor current = db.rawQuery("SELECT quantity FROM inventory WHERE sku=? AND active=1", new String[]{sku})) {
+                            if (!current.moveToFirst() || current.getDouble(0) < quantity) throw new IllegalStateException("Insufficient local stock for " + sku);
+                        }
+                        db.execSQL("UPDATE inventory SET quantity=quantity+? WHERE sku=?", new Object[]{quantity * -1d, sku});
+                    }
+                }
+            }
+            ContentValues event = new ContentValues(); event.put("event_id", UUID.randomUUID().toString()); event.put("operation_id", operationId);
+            event.put("event_type", eventType); event.put("payload", payload); event.put("status", "pending"); event.put("created_at", timestamp); event.put("updated_at", timestamp);
+            db.insertOrThrow("outbox", null, event);
+            if (fiscalInvoice != null) saveFiscalSale(db, operationId, fiscalInvoice, timestamp);
+            db.setTransactionSuccessful();
+        } finally { db.endTransaction(); }
+    }
+
+    public static final class SalePriceChanged extends IllegalStateException {
+        public SalePriceChanged(String sku) { super("Price changed for " + sku + ". Review the updated basket before confirming."); }
+    }
+
+    private void validateSalePrices(SQLiteDatabase db, String payload) {
+        try {
+            JSONArray lines = new JSONObject(payload).optJSONArray("lines");
+            if (lines == null) return;
+            for (int i = 0; i < lines.length(); i++) {
+                JSONObject line = lines.getJSONObject(i);
+                String sku = line.getString("sku");
+                try (Cursor current = db.rawQuery("SELECT i.unit_price,coalesce(d.state_value,'') FROM inventory i "
+                        + "LEFT JOIN device_state d ON d.state_key='price_version_' || i.sku "
+                        + "WHERE i.sku=? AND i.active=1", new String[]{sku})) {
+                    if (!current.moveToFirst() || current.getDouble(0) <= 0
+                            || Double.compare(current.getDouble(0), line.getDouble("unit_price")) != 0
+                            || !current.getString(1).equals(line.optString("price_version_id", ""))) {
+                        throw new SalePriceChanged(sku);
+                    }
+                }
+            }
+        } catch (JSONException error) {
+            throw new IllegalArgumentException("Sale lines could not be checked", error);
+        }
+    }
+
+    /** Ranges are bound to the enrolled device and shop, never to the signed-in cashier. */
+    private JSONObject receiptLease() {
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/storage/LocalStore.java · lines 172–193 ---
+    private String allocateReceipt(String operationId,String payload) {
+        if(!receiptLeaseReady())throw new IllegalStateException("Connect and sync to prepare receipt numbering before selling");
+        try {
+            JSONObject lease=receiptLease();long sequence=lease.getLong("next_sequence");
+            String number=String.format(java.util.Locale.US,"%s-%06d",lease.getString("prefix"),sequence);
+            ContentValues row=new ContentValues();row.put("operation_id",operationId);row.put("receipt_number",number);row.put("lease_id",lease.getString("lease_id"));
+            getWritableDatabase().insertOrThrow("receipt_number",null,row);
+            lease.put("next_sequence",sequence+1);saveState("receipt_lease",lease.toString());
+            return new JSONObject(payload).put("receipt_number",number).put("receipt_lease_id",lease.getString("lease_id")).toString();
+        } catch(org.json.JSONException error){throw new IllegalStateException("Invalid receipt range",error);}
+    }
+    public String receiptNumber(String operationId) {
+        try(Cursor row=getReadableDatabase().rawQuery("SELECT receipt_number FROM receipt_number WHERE operation_id=?",new String[]{operationId})) {
+            return row.moveToFirst()?row.getString(0):operationId.substring(0,Math.min(12,operationId.length()));
+        }
+    }
+    public String receiptLeaseId(String operationId) {
+        try(Cursor row=getReadableDatabase().rawQuery("SELECT lease_id FROM receipt_number WHERE operation_id=?",new String[]{operationId})) {
+            return row.moveToFirst()?row.getString(0):"";
+        }
+    }
+
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/storage/LocalStore.java · lines 500–583 ---
+        if (getWritableDatabase().insertWithOnConflict("receipt", null, values, SQLiteDatabase.CONFLICT_REPLACE) < 0) {
+            throw new IllegalStateException("Could not save receipt");
+        }
+    }
+
+    public String completedPayload(String operationId) {
+        try (Cursor cursor = getReadableDatabase().query("operation_header", new String[]{"payload"},
+                "operation_id=? AND status='completed'", new String[]{operationId}, null, null, null)) {
+            return cursor.moveToFirst() ? cursor.getString(0) : "";
+        }
+    }
+
+    public String receipt(String operationId) {
+        try (Cursor cursor = getReadableDatabase().query("receipt", new String[]{"receipt_text"}, "operation_id=?", new String[]{operationId}, null, null, null)) {
+            return cursor.moveToFirst() ? cursor.getString(0) : "";
+        }
+    }
+
+    public void setReceiptPrinterStatus(String operationId, String status) {
+        ContentValues values = new ContentValues(); values.put("printer_status", status);
+        getWritableDatabase().update("receipt", values, "operation_id=?", new String[]{operationId});
+    }
+
+    public boolean hasUnsubmittedFiscalSales() {
+        try (Cursor cursor = getReadableDatabase().rawQuery(
+                "SELECT 1 FROM mra_sale WHERE state<>'submitted' LIMIT 1", null)) {
+            return cursor.moveToFirst();
+        }
+    }
+
+    private void saveFiscalSale(SQLiteDatabase db, String operationId, JSONObject invoice, String timestamp) {
+        if (hasUnsubmittedFiscalSales()) throw new IllegalStateException("A fiscal sale is already awaiting confirmation.");
+        try {
+            String prefix = (String) invoice.remove("numberPrefix");
+            String counterKey = "mra_sequence_" + prefix;
+            String previous = state(counterKey);
+            long next = previous.isEmpty() ? 1 : Math.addExact(Long.parseLong(previous), 1);
+            String invoiceNumber = prefix + "-" + net.bwanas.mobi.mra.MraInvoice.radix64(next);
+            invoice.getJSONObject("invoiceHeader").put("invoiceNumber", invoiceNumber);
+            saveState(counterKey, Long.toString(next));
+
+            ContentValues row = new ContentValues();
+            row.put("operation_id", operationId);
+            row.put("fiscal_payload", invoice.toString());
+            row.put("state", "ready");
+            row.put("created_at", timestamp);
+            row.put("updated_at", timestamp);
+            db.insertOrThrow("mra_sale", null, row);
+        } catch (JSONException error) {
+            throw new IllegalStateException("The MRA invoice could not be saved.", error);
+        }
+    }
+
+    public FiscalSale fiscalSale(String operationId) {
+        try (Cursor cursor = getReadableDatabase().query("mra_sale",
+                new String[]{"state", "fiscal_payload", "fiscal_response"}, "operation_id=?",
+                new String[]{operationId}, null, null, null)) {
+            return cursor.moveToFirst() ? new FiscalSale(cursor.getString(0), cursor.getString(1), cursor.getString(2)) : null;
+        }
+    }
+
+    public void updateFiscalSale(String operationId, String previous, String state, String response) {
+        ContentValues update = new ContentValues();
+        update.put("state", state);
+        update.put("fiscal_response", response);
+        update.put("updated_at", nowForStorage());
+        if (getWritableDatabase().update("mra_sale", update, "operation_id=? AND state=?",
+                new String[]{operationId, previous}) != 1) {
+            throw new IllegalStateException("The fiscal sale changed during submission.");
+        }
+    }
+
+    public static final class FiscalSale {
+        public final String state;
+        public final String payload;
+        public final String response;
+
+        FiscalSale(String state, String payload, String response) {
+            this.state = state;
+            this.payload = payload;
+            this.response = response;
+        }
+    }
+

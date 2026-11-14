@@ -1,0 +1,248 @@
+--- shop-android/app/src/main/java/net/bwanas/mobi/ReceiptScreens.java · lines 137–383 ---
+    String operationReceipt(String title, String operationId, String timestamp, JSONArray lines) throws Exception {
+        return formatOperation(title, operationId, timestamp, lines,
+                localStore.state("site_name"),
+                localStore.state("cashier_display_name").isEmpty()
+                        ? localStore.state("last_username") : localStore.state("cashier_display_name"));
+    }
+
+    private String formatOperation(String title, String operationId, String timestamp,
+                                   JSONArray lines, String site, String cashier) throws Exception {
+        StringBuilder text = new StringBuilder();
+        text.append(receiptCentre("BWANAS")).append("\n");
+        text.append(receiptCentre(title.toUpperCase() + " RECEIPT")).append("\n");
+        text.append(receiptRule()).append("\n");
+        text.append(receiptPair("Receipt no.", localStore.receiptNumber(operationId))).append("\n");
+        text.append(receiptPair("Date", receiptDateTime(timestamp))).append("\n");
+        text.append(receiptPair("Site", site)).append("\n");
+        text.append(receiptPair("Cashier", cashier)).append("\n");
+        text.append(receiptRule()).append("\n");
+        text.append(receiptItemHeading()).append("\n");
+        java.math.BigDecimal total = java.math.BigDecimal.ZERO;
+        for (int i = 0; i < lines.length(); i++) {
+            JSONObject line = lines.getJSONObject(i); double qty = line.getDouble("quantity"); double price = line.getDouble("unit_price");
+            java.math.BigDecimal amount = TransactionAmounts.lineTotal(qty, price);
+            text.append(receiptItemLine(line.getString("description"), qty, amount.doubleValue())).append("\n");
+            total = total.add(amount);
+        }
+        text.append(receiptRule()).append("\n");
+        if (title.equals("Sale")) {
+            text.append(receiptPair("TOTAL CASH", String.format(Locale.US, "MWK %.2f", total))).append("\n");
+            text.append(receiptRule()).append("\n");
+        } else text.append("Recorded on BWANAS Mobi\n");
+        text.append(receiptRule()).append("\n");
+        text.append(receiptCentre("Thank you")).append("\n\n");
+        return text.toString();
+    }
+
+    static String receiptDateTime(String timestamp) {
+        if (timestamp == null || timestamp.isEmpty()) return "";
+        java.util.regex.Matcher parts = java.util.regex.Pattern.compile(
+                "^(\\d{4}-\\d{2}-\\d{2})[T ](\\d{2}:\\d{2}:\\d{2})(?:\\.\\d+)?(Z|[+-]\\d{2}:?\\d{2})?$"
+        ).matcher(timestamp);
+        if (!parts.matches()) return timestamp;
+        String zone = parts.group(3);
+        String offset = zone == null || zone.equals("Z") ? "+0000" : zone.replace(":", "");
+        try {
+            java.text.SimpleDateFormat input = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", java.util.Locale.ROOT);
+            java.text.SimpleDateFormat output = new java.text.SimpleDateFormat("dd/MM/yyyy HH:mm:ss", java.util.Locale.ROOT);
+            output.setTimeZone(java.util.TimeZone.getTimeZone("Africa/Blantyre"));
+            return output.format(input.parse(parts.group(1) + "T" + parts.group(2) + offset));
+        } catch (java.text.ParseException invalid) {
+            return timestamp;
+        }
+    }
+
+    private String receiptRule() { return "--------------------------------"; }
+
+    private String receiptCentre(String value) {
+        String text = value == null ? "" : value;
+        if (text.length() >= 32) return text.substring(0, 32);
+        int left = (32 - text.length()) / 2;
+        StringBuilder result = new StringBuilder();
+        for (int i = 0; i < left; i++) result.append(' ');
+        return result.append(text).toString();
+    }
+
+    private String receiptPair(String label, String value) {
+        String left = label == null ? "" : label;
+        String right = value == null ? "" : value;
+        if (left.length() > 14) left = left.substring(0, 14);
+        int width = Math.max(0, 32 - left.length() - right.length());
+        StringBuilder result = new StringBuilder(left);
+        for (int i = 0; i < width; i++) result.append(' ');
+        return result.append(right).toString();
+    }
+
+    private String receiptItemHeading() {
+        return String.format(Locale.US, "%-17s %5s %8s", "ITEM", "QTY", "AMO");
+    }
+
+    private String receiptItemLine(String description, double quantity, double amount) {
+        String item = description == null ? "" : description;
+        if (item.length() > 17) item = item.substring(0, 17);
+        return String.format(Locale.US, "%-17s %5.2f %8.2f", item, quantity, amount);
+    }
+
+    private String receiptFor(String operationId) {
+        String existing = localStore.receipt(operationId);
+        if (!existing.isEmpty()) return existing;
+        try {
+            JSONObject payload = new JSONObject(localStore.completedPayload(operationId));
+            if (!"sale".equals(payload.optString("operation_type"))) return "";
+            String cashier = payload.optString("cashier_display_name");
+            if (cashier.isEmpty()) cashier = payload.optString("user_name");
+            String timestamp = payload.getString("completed_at");
+            String rebuilt = formatOperation("Sale", operationId, timestamp, payload.getJSONArray("lines"),
+                    payload.optString("site_display_name", payload.optString("site_code")), cashier);
+            try { localStore.saveReceipt(operationId, rebuilt, timestamp); }
+            catch (RuntimeException ignored) { /* The saved operation still supplies the receipt. */ }
+            return rebuilt;
+        } catch (Exception unavailable) {
+            return "";
+        }
+    }
+
+    void showReceipt(String operationId, boolean fromSale) {
+        activity.setContentView(R.layout.activity_receipt);
+        String receipt = receiptFor(operationId);
+        ((TextView) activity.findViewById(R.id.receiptText)).setText(receipt);
+        TextView status = activity.findViewById(R.id.receiptStatus);
+        activity.findViewById(R.id.receiptBack).setOnClickListener(v -> { if (fromSale) home.run(); else reports.run(); });
+        LocalStore.FiscalSale fiscal = localStore.fiscalSale(operationId);
+        if (fiscal != null) {
+            showFiscalReceipt(operationId, status);
+            return;
+        }
+        if (receipt.isEmpty()) {
+            status.setText("Transaction saved. Receipt is unavailable.");
+            activity.findViewById(R.id.receiptPrint).setEnabled(false);
+            return;
+        }
+        activity.findViewById(R.id.receiptPrint).setOnClickListener(v -> printReceipt(operationId, receipt, status));
+        if (fromSale) printReceipt(operationId, receipt, status);
+    }
+
+    void refreshFiscalReceipt(String operationId) {
+        TextView status = activity.findViewById(R.id.receiptStatus);
+        if (status != null && operationId.equals(status.getTag())) showFiscalReceipt(operationId, status);
+    }
+
+    private void showFiscalReceipt(String operationId, TextView status) {
+        status.setTag(operationId);
+        Button print = activity.findViewById(R.id.receiptPrint);
+        TextView text = activity.findViewById(R.id.receiptText);
+        ImageView image = activity.findViewById(R.id.receiptFiscalQr);
+        print.setEnabled(false);
+        text.setText("");
+        image.setVisibility(View.GONE);
+        LocalStore.FiscalSale fiscal = localStore.fiscalSale(operationId);
+        String url = MraSales.validationUrl(fiscal);
+        if (url.isEmpty()) {
+            status.setText("Sale saved. Waiting for MRA to confirm the fiscal receipt.");
+            return;
+        }
+        try {
+            String receipt = fiscalReceiptText(receiptFor(operationId), MraSales.receiptDetails(fiscal));
+            Bitmap qr = FiscalReceiptPrinter.qrCode(url);
+            text.setText(receipt);
+            image.setImageBitmap(qr);
+            image.setVisibility(View.VISIBLE);
+            status.setText("Confirmed by MRA. Scan the QR code to verify.");
+            print.setEnabled(true);
+            print.setOnClickListener(view -> {
+                print.setEnabled(false);
+                status.setText("Sending fiscal receipt to the embedded printer…");
+                PrinterGateway.printFiscal(activity, receipt, url, (printed, message) -> {
+                    localStore.setReceiptPrinterStatus(operationId, printed ? "printed" : "print_failed");
+                    status.setText(message);
+                    print.setEnabled(true);
+                });
+            });
+        } catch (Exception error) {
+            status.setText("MRA confirmed this sale. The fiscal receipt could not be displayed.");
+        }
+    }
+
+    private String fiscalReceiptText(String receipt, JSONObject fiscal) throws Exception {
+        return receipt + "MRA FISCAL RECEIPT\n" + fiscal.getString("invoice_number") + "\n"
+                + "MRA TPIN " + fiscal.getString("seller_tin") + "\n"
+                + "VAT MWK " + fiscal.getString("total_vat") + "\n";
+    }
+
+    /** Reprints from the report without changing screens, so the receipt action is always visible. */
+    void showReportReceipt(String operationId) {
+        if (localStore.fiscalSale(operationId) != null) {
+            showReceipt(operationId, false);
+            return;
+        }
+        String receipt = receiptFor(operationId);
+        if (receipt.isEmpty()) {
+            Toast.makeText(activity, "This receipt is no longer saved on the POS.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        new AlertDialog.Builder(activity)
+                .setTitle("Reprint receipt")
+                .setMessage(receipt)
+                .setNegativeButton("Close", null)
+                .setPositiveButton("Print", (dialog, which) -> {
+                    PrinterGateway.printSale(activity, receipt, (printed, message) -> {
+                        localStore.setReceiptPrinterStatus(operationId, printed ? "printed" : "print_failed");
+                        Toast.makeText(activity, message, Toast.LENGTH_LONG).show();
+                    });
+                })
+                .show();
+    }
+
+    /** A cloud-confirmed sale is reprinted from the BWANAS server after local history is pruned. */
+    void showServerReceipt(JSONObject sale) {
+        try {
+            String id = sale.getString("id");
+            StringBuilder receipt = new StringBuilder();
+            receipt.append(receiptCentre("BWANAS")).append("\n");
+            receipt.append(receiptCentre("SALES RECEIPT")).append("\n");
+            receipt.append(receiptRule()).append("\n");
+            receipt.append(receiptPair("Receipt no.", sale.optString("receipt_number", sale.optString("device_transaction_id",id).substring(0,Math.min(12,sale.optString("device_transaction_id",id).length()))))).append("\n");
+            receipt.append(receiptPair("Date", receiptDateTime(sale.getString("sold_at")))).append("\n");
+            receipt.append(receiptPair("Site", localStore.state("site_name"))).append("\n");
+            receipt.append(receiptPair("Cashier", sale.optString("cashier", "POS"))).append("\n");
+            receipt.append(receiptRule()).append("\n");
+            receipt.append(receiptItemHeading()).append("\n");
+            JSONArray lines = sale.getJSONArray("lines");
+            for (int i = 0; i < lines.length(); i++) {
+                JSONObject line = lines.getJSONObject(i);
+                receipt.append(receiptItemLine(line.getString("description"), line.getDouble("quantity"), line.getDouble("line_total"))).append("\n");
+            }
+            receipt.append(receiptRule()).append("\n");
+            receipt.append(receiptPair("TOTAL", sale.getString("currency") + " " + sale.getString("total"))).append("\n");
+            receipt.append(receiptCentre("Thank you")).append("\n\n");
+            JSONObject fiscal = sale.optJSONObject("fiscal_receipt");
+            String text = fiscal == null ? receipt.toString() : fiscalReceiptText(receipt.toString(), fiscal);
+            if (fiscal != null) {
+                String url = fiscal.getString("validation_url");
+                Bitmap qr = FiscalReceiptPrinter.qrCode(url);
+                ImageView image = new ImageView(activity);
+                image.setImageBitmap(qr);
+                image.setContentDescription("MRA validation QR code");
+                new AlertDialog.Builder(activity).setTitle("Fiscal receipt").setMessage(text).setView(image)
+                        .setNegativeButton("Close", null)
+                        .setPositiveButton("Print", (dialog, which) -> PrinterGateway.printFiscal(activity, text, url,
+                                (printed, message) -> Toast.makeText(activity, message, Toast.LENGTH_LONG).show())).show();
+            } else {
+                new AlertDialog.Builder(activity).setTitle("Reprint receipt").setMessage(text).setNegativeButton("Close", null)
+                        .setPositiveButton("Print", (dialog, which) -> PrinterGateway.printSale(activity, text,
+                                (printed, message) -> Toast.makeText(activity, message, Toast.LENGTH_LONG).show())).show();
+            }
+        } catch (Exception error) {
+            Toast.makeText(activity, "Receipt could not be opened. Refresh the report and try again.", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void printReceipt(String operationId, String receipt, TextView status) {
+        status.setText("Sending receipt to the embedded printer…");
+        PrinterGateway.printSale(activity, receipt, (printed, message) -> {
+            localStore.setReceiptPrinterStatus(operationId, printed ? "printed" : "print_failed");
+            status.setText(message);
+        });
+    }
+}

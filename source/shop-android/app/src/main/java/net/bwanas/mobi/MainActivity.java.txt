@@ -1,0 +1,220 @@
+--- shop-android/app/src/main/java/net/bwanas/mobi/MainActivity.java · lines 226–273 ---
+    private boolean fiscalSubmissionRequired() {
+        return SecureStore.hasMraConfiguration(this) || SecureStore.hasPendingMraActivation(this)
+                || !localStore.state("mra_assignment_id").isEmpty() || localStore.hasUnsubmittedFiscalSales()
+                || "true".equals(localStore.state("mra_server_activated"));
+    }
+
+    private boolean requireSalesReady() {
+        if (!fiscalSubmissionRequired()) return requireSalesSync();
+        if (SecureStore.hasMraConfiguration(this) && !localStore.hasUnsubmittedFiscalSales()
+                && localStore.state("mra_bound_device").equals(localStore.state("device_id"))) {
+            return requireSalesSync();
+        }
+        new AlertDialog.Builder(this).setTitle("MRA sale unavailable")
+                .setMessage("Finish terminal activation or sync the saved MRA sale before taking another sale.")
+                .setPositiveButton("Sync now", (dialog, which) -> syncAndPruneAsync())
+                .setNegativeButton("Close", null).show();
+        return false;
+    }
+
+    private void syncMraActivation(String deviceKey) {
+        if (localStore.state("mra_assignment_id").isEmpty()) return;
+        if (SecureStore.hasMraConfiguration(this)) {
+            if (localStore.state("mra_activation_status").equals("pending")
+                    && localStore.state("mra_bound_device").equals(localStore.state("device_id"))) {
+                try {
+                    localStore.saveState("mra_activation_status", "activated:" + MraActivationClient.terminalId(this));
+                    localStore.saveState("mra_activation_notice", "");
+                    BwanasApiClient.reportQueue(deviceKey);
+                } catch (Exception ignored) { }
+            }
+            return;
+        }
+        try {
+            if (localStore.queueSummary().getInt("pending_count") > 0) return;
+            JSONObject assignment = BwanasApiClient.deviceMraActivationCode(deviceKey);
+            if (!assignment.getString("assignment_id").equals(localStore.state("mra_assignment_id"))) return;
+            localStore.saveState("mra_bound_device", localStore.state("device_id"));
+            localStore.saveState("mra_activation_status", "pending");
+            String terminal = MraActivationClient.activate(this, assignment.getString("activation_code"),
+                    assignment.getString("product_id"));
+            localStore.saveState("mra_activation_status", "activated:" + terminal);
+            localStore.saveState("mra_activation_notice", "");
+            BwanasApiClient.reportQueue(deviceKey);
+        } catch (Exception error) {
+            localStore.saveState("mra_activation_status", "pending");
+            localStore.saveState("mra_activation_notice", "MRA activation is pending. Check the TAC, product ID and terminal status.");
+        }
+    }
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/MainActivity.java · lines 1238–1357 ---
+    private void completeWorkflow(String title, TextView message) {
+        if(requiredUpdates.blocked()){requiredUpdates.show();return;}
+        if(operationType(title).equals("sale")&&!requireSalesReady())return;
+        if (workflowSubmissionInProgress) return;
+        if (basket.isEmpty()) { message.setText("Add at least one item before confirmation."); return; }
+        boolean sale = "Sale".equals(title);
+        if (sale) {
+            java.math.BigDecimal total = java.math.BigDecimal.ZERO;
+            for (BasketLine line : basket.values()) total = total.add(TransactionAmounts.lineTotal(line.quantity, line.unitPrice));
+            if (total.signum() <= 0 || total.compareTo(new java.math.BigDecimal("1000000000000")) >= 0) {
+                message.setText("The sale total must be positive and within the supported amount.");
+                return;
+            }
+        }
+        String siteCode = localStore.state("site_code");
+        String userName = localStore.state("last_username");
+        if (siteCode.isEmpty() || userName.isEmpty()) { message.setText("This POS must be enrolled and the user must log on before confirmation."); return; }
+        workflowSubmissionInProgress = true;
+        List<BasketLine> selected = new ArrayList<>(basket.values());
+        if (sale && SecureStore.hasMraConfiguration(this)) {
+            message.setText("Checking MRA and saving sale…");
+            worker.execute(() -> saveWorkflow(title, message, true, selected, siteCode, userName));
+        } else {
+            saveWorkflow(title, message, false, selected, siteCode, userName);
+        }
+    }
+
+    private void saveWorkflow(String title, TextView message, boolean fiscal, List<BasketLine> selected,
+                              String siteCode, String userName) {
+        boolean saved = false;
+        try {
+            long soldAt = System.currentTimeMillis();
+            String timestamp = utcTimestamp(soldAt);
+            JSONArray lines = new JSONArray();
+            for (BasketLine line : selected) {
+                LocalStore.InventoryItem item = line.item;
+                lines.put(new JSONObject().put("sku", item.sku).put("description", item.description)
+                        .put("quantity", line.quantity).put("unit_price", line.unitPrice)
+                        .put("price_version_id", item.priceVersionId));
+            }
+            String fingerprint = operationType(title) + "|" + lines.toString();
+            if (!operationType(title).equals("sale") && isRecentDuplicate(fingerprint, message)) { workflowSubmissionInProgress = false; return; }
+            JSONObject payload = new JSONObject().put("operation_type", operationType(title)).put("site_code", siteCode)
+                    .put("user_name", userName).put("site_display_name", localStore.state("site_name"))
+                    .put("cashier_display_name", localStore.state("cashier_display_name")).put("completed_at", timestamp).put("lines", lines);
+            JSONObject fiscalInvoice = fiscal ? mraSales.prepare(lines, timestamp, soldAt) : null;
+            if (fiscalInvoice != null && (!message.isAttachedToWindow() || !localStore.state("last_username").equals(userName))) {
+                throw new IllegalStateException("The cashier changed. Sign in again before making this sale.");
+            }
+            String operationId = localStore.createOperation(operationType(title), siteCode, userName, payload.toString(), timestamp);
+            payload.put("operation_id", operationId);
+            if (operationType(title).equals("sale")) {
+                payload.put("transaction_id", operationId).put("sold_at", timestamp).put("currency", "MWK");
+            }
+            int lineNo = 1;
+            for (BasketLine line : selected) localStore.addOperationLine(operationId, lineNo++, new LocalStore.InventoryItem(line.item.sku, line.item.description, line.unitPrice, line.item.quantity), line.quantity);
+            payload.put("operation_id", operationId);
+            boolean reserveStock = operationType(title).equals("sale");
+            localStore.completeAndQueueWithStockReservation(operationId, operationType(title), payload.toString(),
+                    timestamp, reserveStock, fiscalInvoice);
+            saved = true;
+            localStore.saveReceipt(operationId, receiptScreens.operationReceipt(title, operationId, timestamp, lines), timestamp);
+            if (!reserveStock) rememberSubmission(fingerprint);
+            runOnUiThread(() -> {
+                syncAndPruneAsync();
+                if (!message.isAttachedToWindow()) return;
+                basket.clear();
+                if (reserveStock) {
+                    receiptScreens.showReceipt(operationId, true);
+                    return;
+                }
+                Toast.makeText(this, title + " completed", Toast.LENGTH_SHORT).show();
+                showHome();
+            });
+        } catch (LocalStore.SalePriceChanged error) {
+            runOnUiThread(() -> {
+                if (message.isAttachedToWindow()) {
+                    workflowSubmissionInProgress = false;
+                    reviewChangedBasket(title, message);
+                }
+            });
+        } catch (Exception error) {
+            final boolean committed = saved;
+            runOnUiThread(() -> {
+                if (message.isAttachedToWindow()) workflowSubmissionInProgress = false;
+                if (committed) {
+                    if (message.isAttachedToWindow()) basket.clear();
+                    syncAndPruneAsync();
+                    Toast.makeText(this, "Transaction saved. Open Reports to retrieve the receipt.", Toast.LENGTH_LONG).show();
+                    if (message.isAttachedToWindow()) showHome();
+                } else if (message.isAttachedToWindow()) {
+                    message.setText(fiscal && error instanceof IllegalStateException && error.getMessage() != null
+                            ? error.getMessage() : fiscal ? "MRA sale could not be started. Check the connection and try again."
+                            : "The transaction was not completed. Review the basket and try again.");
+                }
+            });
+        }
+    }
+
+    private void reviewChangedBasket(String title, TextView message) {
+        java.util.Map<String, LocalStore.InventoryItem> latest = new java.util.HashMap<>();
+        for (LocalStore.InventoryItem item : localStore.activeInventory()) latest.put(item.sku, item);
+        java.util.List<String> removed = new java.util.ArrayList<>();
+        java.util.Iterator<java.util.Map.Entry<String, BasketLine>> entries = basket.entrySet().iterator();
+        while (entries.hasNext()) {
+            java.util.Map.Entry<String, BasketLine> entry = entries.next();
+            BasketLine old = entry.getValue();
+            LocalStore.InventoryItem current = latest.get(entry.getKey());
+            if (current == null) {
+                removed.add(old.item.description);
+                entries.remove();
+            } else {
+                entry.setValue(new BasketLine(current, old.quantity, current.unitPrice));
+            }
+        }
+        showBasket(findViewById(R.id.workflowList), findViewById(R.id.workflowHeading),
+                message, findViewById(R.id.primaryAction), title);
+        message.setText("Prices changed. Review the updated basket before confirming."
+                + (removed.isEmpty() ? "" : " Unavailable: " + android.text.TextUtils.join(", ", removed) + "."));
+    }
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/MainActivity.java · lines 1377–1384 ---
+    private String operationType(String title) {
+        if (title.equals("Sale")) return "sale";
+        if (title.equals("Stock Take")) return "stock_take";
+        if (title.equals("Stock Transfer")) return "receive_delivery";
+        if (title.equals("Stock Checkout")) return "stock_checkout";
+        if (title.equals("Cash Opening / Cash-Up")) return "cash_up";
+        return "report";
+    }
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/MainActivity.java · lines 1393–1429 ---
+    private void syncSavedTransactions(String deviceKey) {
+        if (deviceKey.isEmpty()) return;
+        LocalStore.PendingEvent event;
+        while ((event = localStore.nextPendingEvent()) != null) {
+            String type = event.eventType;
+            try {
+                JSONObject queued = new JSONObject(event.payload);
+                switch (type) {
+                    case "sale":
+                        LocalStore.FiscalSale fiscal = localStore.fiscalSale(event.operationId);
+                        if (fiscal != null && !"submitted".equals(fiscal.state)) {
+                            try {
+                                mraSales.confirm(event.operationId, fiscal);
+                                fiscal = localStore.fiscalSale(event.operationId);
+                                String confirmedOperation = event.operationId;
+                                runOnUiThread(() -> receiptScreens.refreshFiscalReceipt(confirmedOperation));
+                            } catch (Exception error) {
+                                String notice = "Saved sale awaiting MRA confirmation. Sync to check again.";
+                                localStore.recordEventFailure(event.eventId, notice);
+                                localStore.saveState("sales_cashier_sync_notice", notice);
+                                runOnUiThread(this::updateReconnectStatus);
+                                return;
+                            }
+                        }
+                        if (fiscal != null) queued.put("fiscal_receipt", MraSales.receiptDetails(fiscal));
+                        try {
+                            BwanasApiClient.submitSale(queued, event.recordedCashier, deviceKey);
+                        } catch (BwanasApiClient.RequestFailure error) {
+                            if (fiscal != null && error.summary().contains("Confirm MRA activation")) {
+                                BwanasApiClient.reportQueue(deviceKey);
+                                localStore.recordEventFailure(event.eventId, "Waiting for BWANAS to record MRA activation. Sync again.");
+                                return;
+                            }
+                            throw error;
+                        }
+                        break;
+                    case "stock_take":

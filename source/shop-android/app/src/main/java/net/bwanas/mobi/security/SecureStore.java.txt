@@ -1,0 +1,78 @@
+--- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 20–48 ---
+/** Stores MRA configuration encrypted with an Android Keystore key unique to this POS. */
+public final class SecureStore {
+    private static final String KEYSTORE = "AndroidKeyStore";
+    private static final String KEY_ALIAS = "bwanas_mobi_mra_config_v1";
+    private static final String PREFS = "bwanas_mobi_secure";
+
+    private SecureStore() { }
+
+    public static void saveMraConfiguration(Context context, String json) throws Exception {
+        save(context, "mra_config", json, true);
+    }
+
+    public static void savePendingMraActivation(Context context, String json) throws Exception {
+        save(context, "mra_activation_pending", json, true);
+    }
+
+    public static String pendingMraActivation(Context context) throws Exception {
+        return read(context, "mra_activation_pending");
+    }
+
+    public static void clearPendingMraActivation(Context context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove("mra_activation_pending").apply();
+    }
+
+    public static boolean hasMraConfiguration(Context context) {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).contains("mra_config");
+    }
+
+    public static String mraConfiguration(Context context) throws Exception { return read(context, "mra_config"); }
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 51–53 ---
+    public static boolean hasPendingMraActivation(Context context) {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).contains("mra_activation_pending");
+    }
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 103–108 ---
+    /** Does not touch local completed transactions; those remain available to an administrator after re-enrolment. */
+    public static void clearDeviceSession(Context context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .remove("device_key").remove("api_username").remove("api_password")
+                .remove("offline_username").remove("offline_salt").remove("offline_verifier").apply();
+    }
+
+--- shop-android/app/src/main/java/net/bwanas/mobi/security/SecureStore.java · lines 123–155 ---
+    private static void save(Context context, String name, String value) throws Exception {
+        save(context, name, value, false);
+    }
+    private static void save(Context context, String name, String value, boolean durable) throws Exception {
+        SecretKey key=getOrCreateKey(); Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding"); cipher.init(Cipher.ENCRYPT_MODE,key);
+        String stored=Base64.encodeToString(cipher.getIV(),Base64.NO_WRAP)+"."+Base64.encodeToString(cipher.doFinal(value.getBytes(StandardCharsets.UTF_8)),Base64.NO_WRAP);
+        android.content.SharedPreferences.Editor editor=context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit().putString(name,stored);
+        if (durable) {
+            if (!editor.commit()) throw new java.io.IOException("Could not save secure device state");
+        } else {
+            editor.apply();
+        }
+    }
+    private static String read(Context context, String name) throws Exception {
+        String stored=context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).getString(name,""); if(stored.isEmpty()) return "";
+        String[] p=stored.split("\\.",2); Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding"); cipher.init(Cipher.DECRYPT_MODE,getOrCreateKey(),new GCMParameterSpec(128,Base64.decode(p[0],Base64.NO_WRAP)));
+        return new String(cipher.doFinal(Base64.decode(p[1],Base64.NO_WRAP)),StandardCharsets.UTF_8);
+    }
+
+    private static SecretKey getOrCreateKey() throws Exception {
+        KeyStore store = KeyStore.getInstance(KEYSTORE);
+        store.load(null);
+        if (store.containsAlias(KEY_ALIAS)) {
+            return ((KeyStore.SecretKeyEntry) store.getEntry(KEY_ALIAS, null)).getSecretKey();
+        }
+        KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE);
+        generator.init(new KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .build());
+        return generator.generateKey();
+    }
+}
